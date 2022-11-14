@@ -1,3 +1,284 @@
+/**
+ * zorder.cpp implement function & aggregate function about zorder
+ *
+ * include: get_range_bounds_single, get_partitionid, interleave_bits
+ */
+#include "postgres.h"
+
+#include <ctype.h>
+#include <stdlib.h>
+#include <time.h>
+#include <random>
+
+#include "utils/zorder.h"
+#include "utils/datum.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/typcache.h"
+
+static ReservoirSamplingState *accumReservoirSampling(FunctionCallInfo fcinfo, ReservoirSamplingState *rstate, MemoryContext rcontext);
+static void array_qsort(ReservoirSamplingState *rstate, int left, int right);
+static int get_partitionid_internal(FunctionCallInfo fcinfo);
+static void interleave_bits_internal(uint *inputs, int num_col, char *bits);
+static int array_argcmp(const void *a, const void *b, void *arg);
+
+/*
+ * reservoir_sampling_transfn
+ */
+Datum reservoir_sampling_transfn(PG_FUNCTION_ARGS)
+{
+    MemoryContext aggcontext;
+    ReservoirSamplingState *rstate = NULL;
+    rstate = PG_ARGISNULL(0) ? NULL : (ReservoirSamplingState *)PG_GETARG_POINTER(0);
+
+    if (!AggCheckCallContext(fcinfo, &aggcontext))
+    {
+        /* cannot be called directly because of internal-type argument */
+        ereport(ERROR,
+                (errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+                 errmsg("reservoir_sampling_transfn called in non-aggregate context")));
+    }
+
+    rstate = accumReservoirSampling(fcinfo, rstate, aggcontext);
+
+    /*
+     * The transition type for array_agg() is declared to be "internal", which
+     * is a pass-by-value type the same size as a pointer.	So we can safely
+     * pass the ArrayBuildState pointer through nodeAgg.c's machinations.
+     */
+    PG_RETURN_POINTER(rstate);
+}
+
+/*
+ * accumResrvoirSampling - accumulate one (more) Datum for an array result
+ *
+ *	astate is working state (NULL on first call)
+ *	rcontext is where to keep working state
+ */
+ReservoirSamplingState *
+accumReservoirSampling(FunctionCallInfo fcinfo, ReservoirSamplingState *rstate, MemoryContext rcontext)
+{
+    MemoryContext arr_context, oldcontext;
+    ArrayBuildState *astate = NULL;
+    Datum dvalue = PG_ARGISNULL(1) ? (Datum)0 : PG_GETARG_DATUM(1);
+    bool disnull = PG_ARGISNULL(1);
+    if (rstate == NULL)
+    {
+        /* First --- initialize */
+        Oid element_type = get_fn_expr_argtype(fcinfo->flinfo, 1);
+        if (element_type == InvalidOid)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("could not determine input data type")));
+
+        int32 partition_num;
+        int32 samplePointsPerPartitionHint;
+        int32 sampling_num;
+        partition_num = PG_ARGISNULL(2) ? 100 : PG_GETARG_INT32(2);
+        samplePointsPerPartitionHint = PG_ARGISNULL(3) ? 1000 : PG_GETARG_INT32(3);
+        sampling_num = partition_num * samplePointsPerPartitionHint;
+        sampling_num = (sampling_num < 1000000 && sampling_num >= 0) ? sampling_num : 1000000;
+        if (sampling_num <= 0)
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+                     errmsg("sampling_size be larger than 0")));
+        }
+
+        /* Make a temporary context to hold all the junk */
+        arr_context = AllocSetContextCreate(rcontext,
+                                            "accumResrvoirSampling",
+                                            ALLOCSET_DEFAULT_MINSIZE,
+                                            ALLOCSET_DEFAULT_INITSIZE,
+                                            ALLOCSET_DEFAULT_MAXSIZE);
+        oldcontext = MemoryContextSwitchTo(arr_context);
+        rstate = (ReservoirSamplingState *)palloc(sizeof(ReservoirSamplingState));
+        rstate->index = 0;
+        rstate->partition_num = partition_num;
+
+        // uniform avg
+        // srand((unsigned int)time(NULL));
+
+        // init ArrayBuildState
+        astate = &rstate->astate;
+        astate->mcontext = arr_context;
+        astate->alen = sampling_num; /* arbitrary starting array size */
+        astate->dvalues = (Datum *)palloc(astate->alen * sizeof(Datum));
+        astate->dnulls = (bool *)palloc(astate->alen * sizeof(bool));
+        astate->nelems = 0;
+        astate->element_type = element_type;
+        get_typlenbyvalalign(element_type,
+                             &astate->typlen,
+                             &astate->typbyval,
+                             &astate->typalign);
+
+        // prepare for elements cmp in array_qsort
+        TypeCacheEntry *typentry = NULL;
+        FunctionCallInfoData locfcinfo;
+        Oid collation = PG_GET_COLLATION();
+        typentry = (TypeCacheEntry *)fcinfo->flinfo->fn_extra;
+        if (typentry == NULL ||
+            typentry->type_id != element_type)
+        {
+            typentry = lookup_type_cache(element_type,
+                                         TYPECACHE_CMP_PROC_FINFO);
+            if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+                ereport(ERROR,
+                        (errcode(ERRCODE_UNDEFINED_FUNCTION),
+                         errmsg("could not identify a comparison function for type %s",
+                                format_type_be(element_type))));
+            fcinfo->flinfo->fn_extra = (void *)typentry;
+        }
+        /*
+         * apply the operator to each pair of array elements.
+         */
+        InitFunctionCallInfoData(locfcinfo, &typentry->cmp_proc_finfo, 2,
+                                 collation, NULL, NULL);
+        locfcinfo.argnull[0] = false;
+        locfcinfo.argnull[1] = false;
+        locfcinfo.isnull = false;
+        rstate->locfcinfo = locfcinfo;
+    }
+    else
+    {
+        astate = &rstate->astate;
+        oldcontext = MemoryContextSwitchTo(astate->mcontext);
+    }
+
+    /*
+     * Ensure pass-by-ref stuff is copied into mcontext; and detoast it too if
+     * it's varlena.  (You might think that detoasting is not needed here
+     * because construct_md_array can detoast the array elements later.
+     * However, we must not let construct_md_array modify the ArrayBuildState
+     * because that would mean array_agg_finalfn damages its input, which is
+     * verboten.  Also, this way frequently saves one copying step.)
+     */
+    if (!disnull && !astate->typbyval)
+    {
+        if (astate->typlen == -1)
+            dvalue = PointerGetDatum(PG_DETOAST_DATUM_COPY(dvalue));
+        else
+            dvalue = datumCopy(dvalue, astate->typbyval, astate->typlen);
+    }
+    // TODO: null data should be not put in reservoir
+    if (astate->nelems >= astate->alen)
+    {
+        std::random_device e; // for uniform random sampling
+        std::uniform_real_distribution<double> u_rand(0, 1);
+        // then sampling by equal probability replacement
+        int random = (int)(u_rand(e) * (rstate->index + 1));
+        // int random = (rand() % (rstate->index));
+        if (random < astate->alen)
+        {
+            astate->dvalues[random] = dvalue;
+            astate->dnulls[random] = disnull;
+        }
+    }
+    else
+    {
+        // first put the reservoir fully
+        astate->dvalues[astate->nelems] = dvalue;
+        astate->dnulls[astate->nelems] = disnull;
+        astate->nelems++;
+    }
+
+    rstate->index++;
+
+    MemoryContextSwitchTo(oldcontext);
+
+    return rstate;
+}
+
+Datum reservoir_sampling_finalfn(PG_FUNCTION_ARGS)
+{
+    Datum result;
+    ReservoirSamplingState *rstate = NULL;
+    ArrayBuildState *sample_astate = NULL;
+    int dims[1];
+    int lbs[1];
+
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL(); /* returns null iff no input values */
+
+    /* cannot be called directly because of internal-type argument */
+    Assert(AggCheckCallContext(fcinfo, NULL));
+
+    rstate = (ReservoirSamplingState *)PG_GETARG_POINTER(0);
+    sample_astate = &rstate->astate;
+
+    // qsort
+    qsort_arg(rstate->astate.dvalues, sample_astate->nelems, sizeof(Datum), array_argcmp, &rstate->locfcinfo);
+
+    // init range bounds partition ArrayBuildState
+    ArrayBuildState *partition_astate = (ArrayBuildState *)palloc(sizeof(ArrayBuildState));
+    partition_astate->mcontext = CurrentMemoryContext;
+    partition_astate->alen = rstate->partition_num - 1;  // bound_num = partition_num - 1;
+    partition_astate->dvalues = (Datum *)palloc0(partition_astate->alen * sizeof(Datum));
+    partition_astate->dnulls = (bool *)palloc0(partition_astate->alen * sizeof(bool));
+    partition_astate->nelems = 0;
+    partition_astate->element_type = sample_astate->element_type;
+    get_typlenbyvalalign(partition_astate->element_type,
+                         &partition_astate->typlen,
+                         &partition_astate->typbyval,
+                         &partition_astate->typalign);
+    // get the range bounds from sample_astate dvalues
+    double single_weight = rstate->index * 1.0 / sample_astate->nelems;
+    double sum_weight = single_weight * sample_astate->nelems;
+    double step = sum_weight / rstate->partition_num;
+    double cum_weight = 0, target = step;
+    Datum pre_key = sample_astate->dvalues[0];
+    FunctionCallInfoData *locfcinfo = &rstate->locfcinfo;
+    for (int i = 0, j = 0; i < sample_astate->nelems && j < partition_astate->alen; i++)
+    {
+        cum_weight += single_weight;
+        if (cum_weight >= target)
+        {
+            // avoid repeat num via cmp
+            locfcinfo->arg[0] = sample_astate->dvalues[i];
+            locfcinfo->arg[1] = pre_key;
+            if (DatumGetInt32(FunctionCallInvoke(locfcinfo)) > 0)
+            {
+                partition_astate->dnulls[j] = false;
+                partition_astate->dvalues[j++] = sample_astate->dvalues[i];
+                partition_astate->nelems++;
+                target += step;
+                pre_key = sample_astate->dvalues[i];
+            }
+        }
+    }
+
+    // make array (i.e. range bounds)
+    dims[0] = partition_astate->nelems;
+    lbs[0] = 1;
+    result = makeMdArrayResult(partition_astate, 1, dims, lbs,
+                               CurrentMemoryContext,
+                               false);
+    // pfree
+    // pfree(sample_astate);
+    // pfree(rstate);
+    PG_RETURN_DATUM(result);
+}
+
+int array_argcmp(const void *a, const void *b, void *arg)
+{
+    FunctionCallInfoData *locfcinfo = (FunctionCallInfoData *)arg;
+    locfcinfo->arg[0] = *(Datum *)a;
+    locfcinfo->arg[1] = *(Datum *)b;
+    return DatumGetInt32(FunctionCallInvoke(locfcinfo));
+}
+
+/*
+ * get_partitionid via binary search O(logn) or sequential search O(n)
+ *      For Fixed-Length Type, we can use binary search directly
+ *      For Variable-Length Type, like numeric text char*, which typlen == -1 or -2,
+ *          we should use sequential search. so it's best not to use the Variable-Length Type in zorder
+ *
+ * TODO: For variable length type, we can define a special range_bounds_array which
+ *           has accumulated position index, so we can use binary search instead of seq search.
+ *       Accumulated position index should initialize in reservoir sampling finalfunc.
+ *       range_bounds like this : [[bounds...], [store index...]]
+ */
 Datum get_partitionid(PG_FUNCTION_ARGS)
 {
     int32 result = -1;
@@ -31,10 +312,12 @@ static int get_partitionid_internal(FunctionCallInfo fcinfo)
     FunctionCallInfoData locfcinfo;
 
     // if value is not null, get value from arg (value is anyelement, i.e. polymorphic)
-    if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+    if (PG_ARGISNULL(0))
         ereport(ERROR,
                 (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                 errmsg("arg cannot be null")));
+                 errmsg("array arg cannot be null")));
+    else if (PG_ARGISNULL(1))
+        return nitems+1;  // return the upper bound + 1 for null
     else
         elt1 = PG_GETARG_DATUM(1);
     // types need to be the same
@@ -156,299 +439,51 @@ static int get_partitionid_internal(FunctionCallInfo fcinfo)
     return result;
 }
 
-
-
-
-
-
-include "postgres.h"
-
-#include "utils/builtins.h"
-#include "utils/zorder.h"
-#include "utils/datum.h"
-#include "utils/typcache.h"
-#include "catalog/pg_type.h"
-
-static int get_partitionid_internal(FunctionCallInfo fcinfo);
-
-Datum get_bounds_addr(PG_FUNCTION_ARGS) {
-    if (PG_ARGISNULL(0))
-        ereport(ERROR,
-                (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                 errmsg("array arg cannot be null")));
-
+/* int32, int32 , ... => bytea */
+Datum interleave_bits(PG_FUNCTION_ARGS)
+{
     ArrayType *array = PG_GETARG_ARRAYTYPE_P(0);
-    ArrayType *result = NULL;
-    Oid element_type = ARR_ELEMTYPE(array);
-    int ndims = ARR_NDIM(array);
-    int *dims = ARR_DIMS(array);
-    int nitems = ArrayGetNItems(ndims, dims);
-    int typlen;
-    // bool typbyval = false;
-    char typalign;
-    TypeCacheEntry *typentry = NULL;
-
-    typentry = (TypeCacheEntry *)fcinfo->flinfo->fn_extra;
-    if (typentry == NULL ||
-        typentry->type_id != element_type)
-    {
-        typentry = lookup_type_cache(element_type,
-                                     TYPECACHE_CMP_PROC_FINFO);
-        fcinfo->flinfo->fn_extra = (void *)typentry;
-    }
-    // Varlena typlen is -1
-    typlen = typentry->typlen;
-    // typbyval = typentry->typbyval;
-    typalign = typentry->typalign;
-
-    // prepare for result array
-    int nbytes = sizeof(int) * nitems;
-    nbytes += ARR_OVERHEAD_NONULLS(ndims);
-    result = (ArrayType *) palloc0(nbytes);
-    SET_VARSIZE(result, nbytes);
-    result->ndim = ndims;
-	result->dataoffset = 0;
-	result->elemtype = element_type;
-
-    // if typlen == -1
-    char *head_ptr = ARR_DATA_PTR(array);
+    int nitems = ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array));
     char *ptr = ARR_DATA_PTR(array);
-    int *data = ARR_DIMS(result);
-    for (int i=0; i<nitems; i++) {
-        data[i] = ptr - head_ptr;
-        ptr = att_addlength_pointer(ptr, typlen, ptr);
-        ptr = (char *)att_align_nominal(ptr, typalign);
-    }
-    PG_RETURN_ARRAYTYPE_P(result);
+
+    uint *data = (uint *)ptr;
+    char *ret_bits = (char *)palloc0(nitems * 4);
+
+    interleave_bits_internal(data, nitems, ret_bits);
+    bytea *result = cstring_to_bytea_with_len(ret_bits, nitems * 4);
+    pfree(ret_bits);
+    PG_RETURN_BYTEA_P(PointerGetDatum(result));
 }
 
-/*
- * get_partitionid via binary search O(logn) or sequential search O(n)
- *      For Fixed-Length Type, we can use binary search directly
- *      For Variable-Length Type, like numeric text char*, which typlen == -1 or -2,
- *          we should use sequential search. so it's best not to use the Variable-Length Type in zorder
- *
- * TODO: For variable length type, we can define a special range_bounds_array which
- *           has accumulated position index, so we can use binary search instead of seq search.
- *       Accumulated position index should initialize in reservoir sampling finalfunc.
- *       range_bounds like this : [[bounds...], [store index...]]
- */
-Datum get_partitionid(PG_FUNCTION_ARGS)
+void interleave_bits_internal(uint *inputs, int num_col, char *bits)
 {
-    int32 result = -1;
+    int ret_idx = 0;
+    int ret_bit = 7;
+    char ret_byte = 0;
 
-    result = (int32)get_partitionid_internal(fcinfo);
-
-    if (result < 0)
+    int bit = 31; /* going from most to least significant bit */
+    while (bit >= 0)
     {
-        ereport(ERROR,
-                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-                 errmsg("result out of range (< 0)")));
-    }
-    PG_RETURN_INT32(result);
-}
-
-static int get_partitionid_internal(FunctionCallInfo fcinfo)
-{
-    if (PG_ARGISNULL(0) || PG_ARGISNULL(2))
-        ereport(ERROR,
-                (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                 errmsg("array arg cannot be null")));
-    ArrayType *array = PG_GETARG_ARRAYTYPE_P(0);
-    ArrayType *array_addr = PG_GETARG_ARRAYTYPE_P(2);
-    Datum elt1;
-    Oid element_type_value = get_fn_expr_argtype(fcinfo->flinfo, 1);
-    Oid element_type_array = ARR_ELEMTYPE(array);
-    int ndims = ARR_NDIM(array);
-    int *dims = ARR_DIMS(array);
-    int nitems = ArrayGetNItems(ndims, dims);
-    int typlen;
-    bool typbyval = false;
-    char typalign;
-    Oid collation = PG_GET_COLLATION();
-    char *ptr = NULL;
-    TypeCacheEntry *typentry = NULL;
-    FunctionCallInfoData locfcinfo;
-
-    // if value is not null, get value from arg (value is anyelement, i.e. polymorphic)
-    if (PG_ARGISNULL(1))
-        return nitems+1;  // return the upper bound + 1 for null
-    else
-        elt1 = PG_GETARG_DATUM(1);
-    // types need to be the same
-    if (element_type_array != element_type_value)
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_DATATYPE_MISMATCH),
-                 errmsg("cannot compare values of different element types for binary search")));
-    }
-
-    // prepare for the cmp operator
-    /*
-     * We arrange to look up the comparison function only once per series of
-     * calls, assuming the element type doesn't change underneath us. The
-     * typcache is used so that we have no memory leakage when being used as
-     * an index support function.
-     */
-    typentry = (TypeCacheEntry *)fcinfo->flinfo->fn_extra;
-    if (typentry == NULL ||
-        typentry->type_id != element_type_array)
-    {
-        typentry = lookup_type_cache(element_type_array,
-                                     TYPECACHE_CMP_PROC_FINFO);
-        if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
-            ereport(ERROR,
-                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
-                     errmsg("could not identify a comparison function for type %s",
-                            format_type_be(element_type_array))));
-        fcinfo->flinfo->fn_extra = (void *)typentry;
-    }
-    // Varlena typlen is -1
-    typlen = typentry->typlen;
-    typbyval = typentry->typbyval;
-    typalign = typentry->typalign;
-
-    /*
-     * apply the operator to each pair of array elements.
-     */
-    InitFunctionCallInfoData(locfcinfo, &typentry->cmp_proc_finfo, 2,
-                             collation, NULL, NULL);
-    // (array should have no null value)
-    int result = -1;
-    // binary search for Fixed-Length Type
-    if (typlen > 0)
-    {
-        int left = 0;
-        int right = nitems - 1;
-        while (left <= right)
+        // interleave from low to high for bits
+        // int idx = 0;  // interleave from back to front for arg
+        int idx = num_col - 1; // interleave from front to back for arg
+        while (idx >= 0)
         {
-            Datum elt0;
-            int mid = left + (right - left) / 2;
-            int32 cmpresult;
-
-            // fetching array values at mid index
-            ptr = ARR_DATA_PTR(array);
-            if (mid > 0)
+            ret_byte = (ret_byte | (((inputs[idx] >> bit) & 1) << ret_bit));
+            ret_bit -= 1;
+            if (ret_bit == -1)
             {
-                ptr = att_addlength_pointer(ptr, typlen * mid, ptr);
-                ptr = (char *)att_align_nominal(ptr, typalign);
+                // finished processing a byte
+                bits[ret_idx] = ret_byte;
+                ret_byte = 0;
+                ret_idx += 1;
+                ret_bit = 7;
             }
-            elt0 = fetch_att(ptr, typbyval, typlen);
-
-            /* Compare the pair of elements */
-            locfcinfo.arg[0] = elt0;
-            locfcinfo.arg[1] = elt1;
-            locfcinfo.argnull[0] = false;
-            locfcinfo.argnull[1] = false;
-            locfcinfo.isnull = false;
-            cmpresult = DatumGetInt32(FunctionCallInvoke(&locfcinfo));
-
-            if (cmpresult == 0)
-            {
-                /* equal */
-                return mid;
-            }
-            else if (cmpresult < 0)
-            {
-                /* array cur_val < arg_1 val, then search backward */
-                left = mid + 1;
-            }
-            else
-            {
-                /* array cur_val > arg_1 val, then search forward */
-                result = mid;
-                right = mid - 1;
-            }
+            idx -= 1;
         }
+        bit -= 1;
     }
-    // binary search for Variable-Length Type
-    else
-    {
-        Oid addr_element_type = ARR_ELEMTYPE(array_addr);
-        if (addr_element_type != INT4OID) {
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATATYPE_MISMATCH),
-                    errmsg("type of arg-3 should be _int4")));
-        }
-        typentry = (TypeCacheEntry *)fcinfo->flinfo->fn_extra;
-        if (typentry == NULL ||
-            typentry->type_id != addr_element_type)
-        {
-            typentry = lookup_type_cache(addr_element_type,
-                                        TYPECACHE_CMP_PROC_FINFO);
-            fcinfo->flinfo->fn_extra = (void *)typentry;
-        }
-        // Varlena typlen is -1
-        int addr_typlen;
-        bool addr_typbyval = false;
-        char addr_typalign;
-        addr_typlen = typentry->typlen;
-        addr_typbyval = typentry->typbyval;
-        addr_typalign = typentry->typalign;
-        int left = 0;
-        int right = nitems - 1;
-        char *addr_ptr = NULL;
-        while (left <= right)
-        {
-            Datum elt0;
-            int mid = left + (right - left) / 2;
-            int32 cmpresult;
-
-            // fetching array values at mid index
-            ptr = ARR_DATA_PTR(array);
-            addr_ptr = ARR_DATA_PTR(array_addr);
-            if (mid > 0)
-            {
-                addr_ptr = att_addlength_pointer(ptr, addr_typlen * mid, ptr);
-                addr_ptr = (char *)att_align_nominal(ptr, addr_typalign);
-                ptr += DatumGetInt32(fetch_att(addr_ptr, addr_typbyval, addr_typlen));
-            }
-            elt0 = fetch_att(ptr, typbyval, typlen);
-
-            /* Compare the pair of elements */
-            locfcinfo.arg[0] = elt0;
-            locfcinfo.arg[1] = elt1;
-            locfcinfo.argnull[0] = false;
-            locfcinfo.argnull[1] = false;
-            locfcinfo.isnull = false;
-            cmpresult = DatumGetInt32(FunctionCallInvoke(&locfcinfo));
-
-            if (cmpresult == 0)
-            {
-                /* equal */
-                return mid;
-            }
-            else if (cmpresult < 0)
-            {
-                /* array cur_val < arg_1 val, then search backward */
-                left = mid + 1;
-            }
-            else
-            {
-                /* array cur_val > arg_1 val, then search forward */
-                result = mid;
-                right = mid - 1;
-            }
-        }
-    }
-
-    /* array is not null, so when result is -1, the elt1 > array[-1] */
-    if (result == -1)
-    {
-        return nitems;
-    }
-    return result;
 }
 
 
-#ifndef ZORDER_H
-#define ZORDER_H
-
-#include "array.h"
-
-/* zorder functions */
-extern Datum get_bounds_addr(PG_FUNCTION_ARGS);
-extern Datum get_partitionid(PG_FUNCTION_ARGS);
-
-#endif /* ZORDER_H */
 
