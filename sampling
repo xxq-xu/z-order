@@ -1,0 +1,437 @@
+#include "postgres.h"
+
+#include <ctype.h>
+#include <stdlib.h>
+#include <time.h>
+
+#include "utils/zorder.h"
+#include "utils/bytea.h"
+#include "utils/datum.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/typcache.h"
+
+ReservoirSamplingState *rs_flatten(ReservoirSamplingState *state)
+{
+    Assert(!state->is_flattened && !state->typbyval);
+    int32 data_size = 0;
+    for (int i = 0; i < state->data_len; i++)
+    {
+        data_size += datumGetSize(RS_ELEM(state, i), state->typbyval, state->typlen);
+    }
+
+    int32 var_len = RS_SIZE(state) + data_size;
+    ReservoirSamplingState *res_state = (ReservoirSamplingState *)palloc0(var_len);
+    RS_SET_SIZE(res_state, var_len);
+    res_state->data_len = state->data_len;
+    res_state->sample_size = state->sample_size;
+    res_state->partition_num = state->partition_num;
+    res_state->input_size = state->input_size;
+    res_state->element_type = state->element_type;
+    res_state->typlen = state->typlen;
+    res_state->typbyval = state->typbyval;
+    res_state->is_flattened = true;
+
+    int32 offset = 0;
+    for (int i = 0; i < state->data_len; i++)
+    {
+        res_state->data[i] = offset;
+        int32 size = datumGetSize(RS_ELEM(state, i), state->typbyval, state->typlen);
+        GS_MEMCPY_S((char *)RS_FLAT_ELEM(res_state, i), size,
+                    (const char *)RS_ELEM(state, i), size);
+        offset += size;
+    }
+    return res_state;
+}
+
+ReservoirSamplingState *rs_de_flatten(ReservoirSamplingState *state)
+{
+    Assert(state->is_flattened && !state->typbyval);
+
+    int32 var_len = RS_HEADER_SIZE + sizeof(Datum) * state->sample_size;
+    ReservoirSamplingState *res_state = (ReservoirSamplingState *)palloc0(var_len);
+    RS_SET_SIZE(res_state, var_len);
+    res_state->data_len = state->data_len;
+    res_state->sample_size = state->sample_size;
+    res_state->partition_num = state->partition_num;
+    res_state->input_size = state->input_size;
+    res_state->element_type = state->element_type;
+    res_state->typlen = state->typlen;
+    res_state->typbyval = state->typbyval;
+    res_state->is_flattened = false;
+
+    for (int i = 0; i < state->data_len; i++)
+    {
+        res_state->data[i] = datumCopy(RS_FLAT_ELEM(state, i), state->typbyval, state->typlen);
+    }
+    return res_state;
+}
+
+Datum reservoir_sampling_transfn(PG_FUNCTION_ARGS)
+{
+    Oid arg1_typeid = get_fn_expr_argtype(fcinfo->flinfo, 1);
+    MemoryContext aggcontext, old_context;
+    ReservoirSamplingState *state = PG_ARGISNULL(0) ? NULL : (ReservoirSamplingState *)PG_GETARG_POINTER(0);
+    Datum elem = PG_ARGISNULL(1) ? (Datum)0 : PG_GETARG_DATUM(1);
+    int32 partition_num = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
+
+    if (arg1_typeid == InvalidOid)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("could not determine input data type")));
+
+    if (!AggCheckCallContext(fcinfo, &aggcontext))
+    {
+        /* cannot be called directly because of pass-by-ref argument */
+        ereport(ERROR,
+                (errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+                 errmsg("reservoir_sampling_transfn called in non-aggregate context")));
+    }
+
+    if (partition_num <= 0 || partition_num > MAX_SAMPLE_SIZE)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+                 errmsg("partition_num should >0 and <= %d", MAX_SAMPLE_SIZE)));
+    }
+
+    /* 即使在这里切换到aggcontext中申请内存，nodeAgg还是会在transvalue初始化后将其copy到aggcontext中 */
+    if (PG_ARGISNULL(0))
+    {
+        /* First time through --- initialize */
+
+        int16 typlen;
+        bool typbyval;
+        get_typlenbyval(arg1_typeid, &typlen, &typbyval);
+
+        int64 sample_size_64 = SAMPLE_HINT * partition_num; // prevent overflow
+        int32 sample_size = Min(sample_size_64, MAX_SAMPLE_SIZE);
+
+        int32 var_len = RS_HEADER_SIZE + sizeof(Datum) * sample_size;
+
+        state = (ReservoirSamplingState *)palloc0(var_len);
+        RS_SET_SIZE(state, var_len);
+        state->data_len = 0;
+        state->input_size = 0;
+        state->sample_size = sample_size;
+        state->partition_num = partition_num;
+        state->element_type = arg1_typeid;
+        state->typlen = typlen;
+        state->typbyval = typbyval;
+        state->is_flattened = false;
+
+        // TODO: use XOrShiftRandom or more effective random
+        srand((unsigned int)time(NULL));
+    }
+
+    /* skip the null element */
+    if (PG_ARGISNULL(1))
+    {
+        PG_RETURN_POINTER(state);
+    }
+
+    /* palloc from aggcontext */
+    old_context = MemoryContextSwitchTo(aggcontext);
+
+    if (state->data_len < state->sample_size)
+    {
+        /*
+         * Ensure pass-by-ref stuff is copied into aggcontext; and detoast it too if
+         * it's varlena.
+         */
+        state->data[state->data_len++] = datumCopy(elem, state->typbyval, state->typlen);
+    }
+    else
+    {
+        int32 random = (int32)rand() % state->input_size;
+        if (random < state->sample_size)
+        {
+            state->data[random] = datumCopy(elem, state->typbyval, state->typlen);
+        }
+    }
+
+    state->input_size++;
+
+    MemoryContextSwitchTo(old_context);
+
+    PG_RETURN_POINTER(state);
+}
+
+Datum reservoir_sampling_collecfn(PG_FUNCTION_ARGS)
+{
+    MemoryContext aggcontext, old_context;
+    ReservoirSamplingState *collect_state = PG_ARGISNULL(0) ? NULL : (ReservoirSamplingState *)PG_GETARG_POINTER(0);
+    ReservoirSamplingState *trans_state = PG_ARGISNULL(1) ? NULL : (ReservoirSamplingState *)PG_GETARG_POINTER(1);
+
+    if (!AggCheckCallContext(fcinfo, &aggcontext))
+    {
+        /* cannot be called directly because of pass-by-ref argument */
+        ereport(ERROR,
+                (errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+                 errmsg("reservoir_sampling_collecfn called in non-aggregate context")));
+    }
+
+    /* if transvalue is null, just return collecvalue althought collecvalue is not initialized */
+    if (PG_ARGISNULL(1))
+    {
+        if (collect_state == NULL)
+            PG_RETURN_NULL();
+        PG_RETURN_POINTER(collect_state);
+    }
+
+    /* switchto aggcontext to make collectval pass-by-ref */
+    old_context = MemoryContextSwitchTo(aggcontext);
+
+    if (PG_ARGISNULL(0))
+    {
+        /* First time through --- initialize */
+
+        if (trans_state->typbyval)
+        {
+            Assert(!trans_state->is_flattened);
+            collect_state = trans_state;
+        }
+        else
+        {
+            Assert(trans_state->is_flattened);
+            collect_state = rs_de_flatten(trans_state);
+        }
+
+        // TODO: use XOrShiftRandom or more effective random
+        srand((unsigned int)time(NULL));
+
+        MemoryContextSwitchTo(old_context);
+        PG_RETURN_POINTER(collect_state);
+    }
+
+    /* merge collecvalue and transvalue from datanodes to a new collecvalue */
+    int32 sum_input_size = collect_state->input_size + trans_state->input_size;
+    int32 data_len = Min(collect_state->data_len, trans_state->data_len);
+
+    for (int i = 0; i < data_len; i++)
+    {
+        int random = rand() % sum_input_size;
+        if (random > collect_state->input_size)
+        {
+            Datum value = RS_ELEM_ANY(trans_state, i);
+            collect_state->data[i] = datumCopy(value, trans_state->typbyval, trans_state->typlen);
+        }
+    }
+
+    for (int i = collect_state->data_len; i < trans_state->data_len; i++)
+    {
+        Datum value = RS_ELEM_ANY(trans_state, i);
+        collect_state->data[i] = datumCopy(value, trans_state->typbyval, trans_state->typlen);
+    }
+
+    collect_state->data_len = Max(collect_state->data_len, trans_state->data_len);
+    collect_state->input_size = sum_input_size;
+
+    MemoryContextSwitchTo(old_context);
+    PG_RETURN_POINTER(collect_state);
+}
+
+int element_cpmarator(const void *a, const void *b, void *arg)
+{
+    FunctionCallInfoData *locfcinfo = (FunctionCallInfoData *)arg;
+
+    Datum elt1 = *(Datum *)a;
+    Datum elt2 = *(Datum *)b;
+
+    locfcinfo->arg[0] = elt1;
+    locfcinfo->arg[1] = elt2;
+    locfcinfo->argnull[0] = false;
+    locfcinfo->argnull[1] = false;
+    locfcinfo->isnull = false;
+    int cmpresult = DatumGetInt32(FunctionCallInvoke(locfcinfo));
+    return cmpresult;
+}
+
+Datum reservoir_sampling_finalfn(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    // TODO: single datanode have bug?
+    /* cannot be called directly because of internal-type argument */
+    // Assert(AggCheckCallContext(fcinfo, NULL));
+
+    ReservoirSamplingState *state = (ReservoirSamplingState *)PG_GETARG_POINTER(0);
+
+    Assert(!state->is_flattened);
+
+    /* maybe execute again */
+    TypeCacheEntry *typentry = (TypeCacheEntry *)fcinfo->flinfo->fn_extra;
+    if (typentry == NULL || typentry->type_id != state->element_type)
+    {
+        typentry = lookup_type_cache(state->element_type, TYPECACHE_CMP_PROC_FINFO);
+        if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
+                     errmsg("could not identify a comparison function for type %s",
+                            format_type_be(state->element_type))));
+        fcinfo->flinfo->fn_extra = (void *)typentry;
+    }
+
+    FunctionCallInfoData locfcinfo;
+    Oid collation = PG_GET_COLLATION();
+    InitFunctionCallInfoData(locfcinfo, &typentry->cmp_proc_finfo, 2,
+                             collation, NULL, NULL);
+
+    /* sort */
+    qsort_arg(state->data, state->data_len, sizeof(Datum), element_cpmarator, (void *)&locfcinfo);
+
+    int array_len = Min(state->data_len, state->partition_num);
+    int step = state->data_len > state->partition_num ? state->data_len / state->partition_num : 1;
+
+    ReservoirSamplingState *result = (ReservoirSamplingState *)palloc(RS_HEADER_SIZE + array_len * sizeof(Datum));
+    RS_SET_SIZE(result, RS_HEADER_SIZE + array_len * sizeof(Datum));
+    result->data_len = array_len;
+    result->input_size = state->input_size;
+    result->partition_num = state->partition_num;
+    result->sample_size = state->sample_size;
+    result->element_type = state->element_type;
+    result->typlen = state->typlen;
+    result->typbyval = state->typbyval;
+    result->is_flattened = state->is_flattened;
+
+    /* final sampling */
+    for (int i = 0; i < array_len; i++)
+    {
+        int index = Min(i * step, state->data_len - 1);
+        result->data[i] = RS_ELEM(state, index);
+    }
+
+    if (!result->typbyval)
+    {
+        result = rs_flatten(result);
+    }
+
+    PG_RETURN_POINTER(result);
+}
+
+Datum get_partitionid(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    /* the patitionid of null is 0 */
+    if (PG_ARGISNULL(1))
+        PG_RETURN_INT32(0);
+
+    ReservoirSamplingState *state = (ReservoirSamplingState *)PG_GETARG_POINTER(0);
+    Oid arg1_typeid = get_fn_expr_argtype(fcinfo->flinfo, 1);
+    if (arg1_typeid == InvalidOid)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("could not determine input data type")));
+    if (arg1_typeid != state->element_type)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("cannot compare values of different element types for binary search")));
+    Datum elem = PG_GETARG_DATUM(1);
+
+    /*
+     * We arrange to look up the comparison function only once per series of
+     * calls, assuming the element type doesn't change underneath us. The
+     * typcache is used so that we have no memory leakage when being used as
+     * an index support function.
+     */
+    TypeCacheEntry *typentry = (TypeCacheEntry *)fcinfo->flinfo->fn_extra;
+    if (typentry == NULL ||
+        typentry->type_id != state->element_type)
+    {
+        typentry = lookup_type_cache(state->element_type,
+                                     TYPECACHE_CMP_PROC_FINFO);
+        if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
+                     errmsg("could not identify a comparison function for type %s",
+                            format_type_be(state->element_type))));
+        fcinfo->flinfo->fn_extra = (void *)typentry;
+    }
+
+    FunctionCallInfoData locfcinfo;
+    Oid collation = PG_GET_COLLATION();
+    InitFunctionCallInfoData(locfcinfo, &typentry->cmp_proc_finfo, 2, collation, NULL, NULL);
+
+    /* lower_bound from STL https://en.cppreference.com/w/cpp/algorithm/lower_bound */
+    int first = 0, last = state->data_len;
+    int it, step, count = last - first;
+
+    while (count > 0)
+    {
+        step = count / 2;
+        it = first + step;
+
+        /* Compare the pair of elements */
+        locfcinfo.arg[0] = RS_ELEM_ANY(state, it);
+        locfcinfo.arg[1] = elem;
+        locfcinfo.argnull[0] = false;
+        locfcinfo.argnull[1] = false;
+        locfcinfo.isnull = false;
+        int cmpresult = DatumGetInt32(FunctionCallInvoke(&locfcinfo));
+
+        if (cmpresult < 0)
+        {
+            first = ++it;
+            count -= step + 1;
+        }
+        else
+        {
+            count = step;
+        }
+    }
+
+    PG_RETURN_INT32(first);
+}
+
+Datum reservoir_sampling_state_in(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_POINTER(byteain(fcinfo));
+}
+
+Datum reservoir_sampling_state_out(PG_FUNCTION_ARGS)
+{
+    ReservoirSamplingState *state = (ReservoirSamplingState *)PG_GETARG_BYTEA_P_COPY(0);
+    if (!state->is_flattened && !state->typbyval)
+    {
+        state = rs_flatten(state);
+    }
+    fcinfo->arg[0] = (Datum)state;
+    PG_RETURN_CSTRING(byteaout(fcinfo));
+}
+
+Datum reservoir_sampling_state_recv(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_POINTER(bytearecv(fcinfo));
+}
+
+Datum reservoir_sampling_state_send(PG_FUNCTION_ARGS)
+{
+    ReservoirSamplingState *state = (ReservoirSamplingState *)PG_GETARG_BYTEA_P_COPY(0);
+    if (!state->typbyval)
+    {
+        state = rs_flatten(state);
+    }
+    fcinfo->arg[0] = (Datum)state;
+    PG_RETURN_BYTEA_P(byteasend(fcinfo));
+}
+
+Datum reservoir_sampling_state_print(PG_FUNCTION_ARGS)
+{
+    ReservoirSamplingState *state = (ReservoirSamplingState *)PG_GETARG_BYTEA_P_COPY(0);
+    char *result = (char *)palloc(200 + state->data_len * 16);
+    char *index = result;
+    index += sprintf(index, "{vl_len:%d, data_len:%d, sample_size:%d, partition_num:%d,input_size:%d, element_type:%d, typlen:%d}[",
+                     RS_SIZE(state), state->data_len, state->sample_size, state->partition_num,
+                     state->input_size, state->element_type, state->typlen);
+    for (int i = 0; i < state->data_len; i++)
+    {
+        index += sprintf(index, "%ld, ", (uint64_t)state->data[i]);
+    }
+    index += sprintf(index, "]");
+    *index = '\0';
+    PG_RETURN_CSTRING(result);
+}
