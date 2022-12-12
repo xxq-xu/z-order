@@ -56,3 +56,31 @@ extern Datum get_partitionid(PG_FUNCTION_ARGS);
 extern ReservoirSamplingState *rs_flatten(ReservoirSamplingState *state);
 
 #endif /* ZORDER_H */
+
+
+
+
+#ifndef ZORDER_H
+#define ZORDER_H
+
+#include "array.h"
+/*
+ * working state for accumReservoirSampling and friends
+ */
+typedef struct ReservoirSamplingState
+{
+	ArrayBuildState astate;
+	FunctionCallInfoData locfcinfo;  // for cmp in array_qsort
+	int partition_num;
+	int index;
+}ReservoirSamplingState;
+
+/* TODO zorder functions */
+extern Datum reservoir_sampling_transfn(PG_FUNCTION_ARGS);
+extern Datum reservoir_sampling_finalfn(PG_FUNCTION_ARGS);
+extern Datum get_partitionid(PG_FUNCTION_ARGS);
+extern Datum interleave_bits(PG_FUNCTION_ARGS);
+extern Datum get_bounds_addr(PG_FUNCTION_ARGS);
+
+#endif /* ZORDER_H */
+
