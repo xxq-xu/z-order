@@ -26,3 +26,11 @@ DynamoDB:
 https://aws.amazon.com/blogs/database/z-order-indexing-for-multifaceted-queries-in-amazon-dynamodb-part-1/
 https://aws.amazon.com/blogs/database/z-order-indexing-for-multifaceted-queries-in-amazon-dynamodb-part-2/
 https://aws.amazon.com/blogs/database/amazon-aurora-under-the-hood-indexing-geospatial-data-using-z-order-curves/
+
+interleave_bits:
+http://graphics.stanford.edu/~seander/bithacks.html#InterleaveTableObvious
+
+pg增加一个内核函数：
+https://www.jianshu.com/p/a4c8d8f06439?u_atoken=6e83614a-94a7-4586-8876-0f4faf8ee70b&u_asession=01Ur-wXQ_XSX2q1eC9xN08xuPPpUV6tYRrysfGdakIR3NJm0pBxP67c8W87-NKe_TmX0KNBwm7Lovlpxjd_P_q4JsKWYrT3W_NKPr8w6oU7K-kfPc9v6QItFpm6-MRRcx9fT23-3PkyDy9XbOaRLWwzmBkFo3NEHBv0PZUm6pbxQU&u_asig=05ME-zOSw3KX_Yo18FVNB_SxH7neBKjiUW8zFJBYRgVV1NdiWkyuwRJXa-wSNqhszaqu3qaibq2ahT5w3SzKN0S2pN3ATSwU8rPottp6DCC1VZOS8YzxCcUsRb5h6jjiPyENlfdzFtSHInHMVyeakm8EOrNzdeOZPidoSVKST3NPv9JS7q8ZD7Xtz2Ly-b0kmuyAKRFSVJkkdwVUnyHAIJzVrrRGpQXHCeXGs8eub0AOqE_T_Svv9u8rS8XRpahS3W5tlkRHxf-gZK6IjlEzte9e3h9VXwMyh6PgyDIVSG1W8UfVH-Swei4x5IhI71x4e-yeddtsgrM7GqljNTK8OvHvtX37zAKvuuGU_O7U3xuoXhUFYwUAgmLNICG8G11UdemWspDxyAEEo4kbsryBKb9Q&u_aref=J9U%2BdrwuTuHVqqJecL9wGaip3S4%3D
+
+
